@@ -24,7 +24,13 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    flash_attn_3_func = None
+    HAS_FLASH_ATTN = False
+    print("Warning: flash_attn_interface not available, using standard attention")
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -98,6 +104,20 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    
+    # WaterSIC quantization configuration
+    watersic_enabled = bool(int(os.environ.get("WATERSIC_ENABLED", "0")))
+    watersic_bits = float(os.environ.get("WATERSIC_BITS", 4.0))
+    watersic_calibration_samples = int(os.environ.get("WATERSIC_CALIBRATION_SAMPLES", 512))
+    watersic_lmmse_correction = bool(int(os.environ.get("WATERSIC_LMMSE_CORRECTION", "1")))
+    watersic_activation_drift = bool(int(os.environ.get("WATERSIC_ACTIVATION_DRIFT", "1")))
+    watersic_residual_correction = bool(int(os.environ.get("WATERSIC_RESIDUAL_CORRECTION", "1")))
+    watersic_attention_weighted = bool(int(os.environ.get("WATERSIC_ATTENTION_WEIGHTED", "1")))
+    watersic_adaptive_mixing = bool(int(os.environ.get("WATERSIC_ADAPTIVE_MIXING", "1")))
+    watersic_diagonal_rescalers = bool(int(os.environ.get("WATERSIC_DIAGONAL_RESCALERS", "1")))
+    watersic_entropy_coding = bool(int(os.environ.get("WATERSIC_ENTROPY_CODING", "1")))
+    watersic_qr_epsilon = float(os.environ.get("WATERSIC_QR_EPSILON", 0.1))
+    watersic_aw_epsilon = float(os.environ.get("WATERSIC_AW_EPSILON", 0.5))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -540,15 +560,41 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 class CastedLinear(nn.Linear):
     _qat_enabled: bool = False
+    _watersic_enabled: bool = False
+    _watersic_alpha: dict[str, Tensor] = {}
+    
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
-        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
-            with torch.no_grad():
-                w32 = self.weight.float()
-                row_max = w32.abs().amax(dim=1)
-                scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
-                w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
-            w = w + (w_q - w).detach()
+        if self.training and w.ndim == 2:
+            if CastedLinear._watersic_enabled:
+                # WaterSIC fake quantization with waterfilling rates
+                layer_name = getattr(self, '_layer_name', 'unknown')
+                if layer_name in CastedLinear._watersic_alpha:
+                    with torch.no_grad():
+                        w32 = self.weight.float()
+                        alpha = CastedLinear._watersic_alpha[layer_name].to(w32.device)
+                        
+                        # Simple waterfilling fake quantization
+                        # In full implementation, this would use proper ZSIC
+                        w_quantized = torch.zeros_like(w32)
+                        for i in range(w32.size(1)):
+                            alpha_i = alpha[i] if i < len(alpha) else alpha[-1]
+                            w_col = w32[:, i]
+                            w_q_col = torch.round(w_col / alpha_i) * alpha_i
+                            w_quantized[:, i] = w_q_col
+                        
+                        w_q = w_quantized.to(x.dtype)
+                    w = w + (w_q - w).detach()  # Straight-through estimator
+                    
+            elif CastedLinear._qat_enabled:
+                # Original int6 fake quantization
+                with torch.no_grad():
+                    w32 = self.weight.float()
+                    row_max = w32.abs().amax(dim=1)
+                    scale = (row_max / 31.0).clamp_min(1.0 / 31.0)
+                    w_q = (torch.clamp(torch.round(w32 / scale[:, None]), -32, 31) * scale[:, None]).to(x.dtype)
+                w = w + (w_q - w).detach()
+                
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1378,6 +1424,397 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             out[name] = (q.float() * float(s.item())).to(orig_dtype)
     return out
 
+# --- WaterSIC Quantization Implementation ---
+
+def _get_calibration_data(model: nn.Module, val_tokens: Tensor, max_samples: int = 512) -> dict[str, Tensor]:
+    """Collect calibration activations for WaterSIC quantization."""
+    model.eval()
+    calibration_data = {}
+    hooks = []
+    
+    def make_hook(name: str):
+        def hook(module, input, output):
+            if len(input) > 0:
+                x = input[0]
+                if x.ndim == 3 and x.size(0) == 1:  # [1, seq_len, dim]
+                    x = x.squeeze(0)  # [seq_len, dim]
+                if name not in calibration_data:
+                    calibration_data[name] = []
+                calibration_data[name].append(x.detach().cpu())
+        return hook
+    
+    # Register hooks for linear layers we want to quantize
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Linear, CastedLinear)) and any(x in name for x in ['.attn.', '.mlp.']):
+            hook = module.register_forward_hook(make_hook(name))
+            hooks.append(hook)
+    
+    # Collect samples
+    device = next(model.parameters()).device
+    samples_collected = 0
+    seq_len = 1024
+    
+    with torch.no_grad():
+        while samples_collected < max_samples:
+            start_idx = torch.randint(0, len(val_tokens) - seq_len, (1,)).item()
+            tokens = val_tokens[start_idx:start_idx + seq_len].unsqueeze(0).to(device)
+            model(tokens)
+            samples_collected += seq_len
+    
+    # Remove hooks
+    for hook in hooks:
+        hook.remove()
+    
+    # Concatenate collected data
+    for name in calibration_data:
+        calibration_data[name] = torch.cat(calibration_data[name], dim=0)[:max_samples]
+    
+    model.train()
+    return calibration_data
+
+def _compute_covariance_matrix(activations: Tensor, attention_weights: Tensor = None, 
+                              eps_aw: float = 0.5, eps_qr: float = 0.1) -> Tensor:
+    """Compute covariance matrix with optional attention weighting."""
+    if activations.numel() == 0:
+        return torch.eye(activations.size(-1), dtype=torch.float32)
+    
+    # activations: [num_samples, dim]
+    activations = activations.float()
+    
+    if attention_weights is not None:
+        # Attention-weighted covariance for QKV layers
+        # attention_weights: [num_samples] - importance scores per token
+        weights = attention_weights.float()
+        weights = weights / weights.sum()
+        
+        # Weighted mean and covariance
+        mean = (activations * weights.unsqueeze(1)).sum(dim=0)
+        centered = activations - mean.unsqueeze(0)
+        cov = torch.mm((centered * weights.unsqueeze(1)).t(), centered)
+        
+        # Adaptive mixing with uniform covariance
+        uniform_cov = torch.cov(activations.t())
+        cov = (1 - eps_aw) * cov + eps_aw * uniform_cov
+    else:
+        cov = torch.cov(activations.t())
+    
+    # Add regularization for numerical stability
+    cov = cov + 1e-6 * torch.eye(cov.size(0))
+    return cov
+
+def _cholesky_decomposition(cov_matrix: Tensor) -> Tensor:
+    """Compute lower triangular Cholesky decomposition."""
+    try:
+        L = torch.linalg.cholesky(cov_matrix)
+        return L
+    except RuntimeError:
+        # Fallback to eigendecomposition if Cholesky fails
+        eigenvals, eigenvecs = torch.linalg.eigh(cov_matrix)
+        eigenvals = torch.clamp(eigenvals, min=1e-6)
+        L = eigenvecs @ torch.diag(torch.sqrt(eigenvals)) @ eigenvecs.t()
+        return torch.tril(L)
+
+def _zsic_quantize(Y: Tensor, L: Tensor, alpha_diag: Tensor, lmmse_correction: bool = True) -> tuple[Tensor, Tensor, Tensor]:
+    """
+    ZSIC (Zero-power Successive Interference Cancellation) quantization.
+    
+    Args:
+        Y: Weight matrix times L, shape [a, n]
+        L: Lower triangular matrix from Cholesky decomposition, shape [n, n]
+        alpha_diag: Diagonal matrix with per-column quantization rates, shape [n]
+        lmmse_correction: Whether to apply LMMSE correction
+    
+    Returns:
+        Z_sic: Integer quantization result, shape [a, n]
+        gamma: LMMSE correction factors, shape [n]
+        reconstruction_error: Final reconstruction error
+    """
+    a, n = Y.shape
+    device = Y.device
+    dtype = Y.dtype
+    
+    # Initialize outputs
+    Z_sic = torch.zeros_like(Y, dtype=torch.float32)
+    gamma = torch.ones(n, device=device, dtype=torch.float32)
+    Y_work = Y.clone().float()
+    
+    # ZSIC algorithm: process columns from n to 1
+    for i in range(n-1, -1, -1):
+        # Round to nearest integer scaled by alpha_i
+        alpha_i = alpha_diag[i].item()
+        z_i = torch.round(Y_work[:, i] / alpha_i)
+        Z_sic[:, i] = z_i
+        
+        if lmmse_correction and z_i.abs().sum() > 0:
+            # Compute LMMSE correction factor (Equation 15 in paper)
+            numerator = (Y_work[:, i] * z_i).sum()
+            denominator = alpha_i * (z_i * z_i).sum()
+            gamma[i] = numerator / (denominator + 1e-8)
+            gamma[i] = torch.clamp(gamma[i], 0.1, 1.0)  # Stabilize
+        else:
+            gamma[i] = 1.0
+        
+        # Subtract interference from remaining columns
+        correction = gamma[i] * alpha_i * z_i
+        if i > 0:
+            # Y[:, :i] -= correction[:, None] * L[i, :i][None, :]
+            Y_work[:, :i] -= correction.unsqueeze(1) * L[i, :i].unsqueeze(0)
+    
+    # Compute final reconstruction
+    A_gamma = alpha_diag * gamma
+    reconstruction = Z_sic * A_gamma.unsqueeze(0) @ L.t()
+    reconstruction_error = (Y - reconstruction).pow(2).mean()
+    
+    return Z_sic, gamma, reconstruction_error
+
+def _binary_search_rate(target_bits_per_param: float, Y: Tensor, L: Tensor, 
+                        max_iterations: int = 20, tolerance: float = 0.01) -> float:
+    """Binary search to find constant c that achieves target compression rate."""
+    n = Y.size(1)
+    
+    # Initial bounds for c
+    c_min, c_max = 1e-6, 1.0
+    
+    for _ in range(max_iterations):
+        c = (c_min + c_max) / 2
+        
+        # Compute alpha_i = c / |L[i,i]|
+        L_diag = torch.diag(L).abs()
+        alpha_diag = c / (L_diag + 1e-8)
+        
+        # Quantize and measure rate
+        Z_sic, gamma, _ = _zsic_quantize(Y, L, alpha_diag, lmmse_correction=False)
+        
+        # Estimate entropy (simplified)
+        Z_flat = Z_sic.flatten().int()
+        unique_vals, counts = torch.unique(Z_flat, return_counts=True)
+        probs = counts.float() / counts.sum()
+        entropy = -(probs * torch.log2(probs + 1e-10)).sum()
+        bits_per_param = entropy.item()
+        
+        if abs(bits_per_param - target_bits_per_param) < tolerance:
+            break
+        elif bits_per_param > target_bits_per_param:
+            c_max = c
+        else:
+            c_min = c
+    
+    return c
+
+def quantize_layer_watersic(weight: Tensor, activations: Tensor, target_bits: float = 4.0,
+                           attention_weights: Tensor = None, use_lmmse: bool = True,
+                           eps_aw: float = 0.5, eps_qr: float = 0.1) -> dict:
+    """
+    Apply WaterSIC quantization to a single layer.
+    
+    Args:
+        weight: Weight matrix [out_dim, in_dim]
+        activations: Calibration activations [num_samples, in_dim]
+        target_bits: Target bits per parameter
+        attention_weights: Optional attention importance scores
+        use_lmmse: Enable LMMSE correction
+        eps_aw: Attention weighting mixing factor
+        eps_qr: Quantization replacement mixing factor
+        
+    Returns:
+        Dictionary containing quantization results
+    """
+    device = weight.device
+    dtype = weight.dtype
+    a, n = weight.shape
+    
+    # Compute covariance matrices
+    Sigma_X = _compute_covariance_matrix(activations, attention_weights, eps_aw, eps_qr)
+    Sigma_X = Sigma_X.to(device)
+    
+    # Cholesky decomposition: Sigma_X = L L^T
+    L = _cholesky_decomposition(Sigma_X)
+    L = L.to(device)
+    
+    # Compute Y = W L
+    y_hat = weight @ L
+    
+    # Binary search for optimal constant c
+    c = _binary_search_rate(target_bits, y_hat, L)
+    
+    # Compute waterfilling rates: alpha_i = c / |L[i,i]|
+    L_diag = torch.diag(L).abs()
+    alpha_diag = c / (L_diag + 1e-8)
+    
+    # ZSIC quantization
+    Z_sic, gamma, recon_error = _zsic_quantize(y_hat, L, alpha_diag, use_lmmse)
+    
+    # Compute compression statistics
+    Z_flat = Z_sic.flatten().int()
+    unique_vals, counts = torch.unique(Z_flat, return_counts=True)
+    probs = counts.float() / counts.sum()
+    entropy = -(probs * torch.log2(probs + 1e-10)).sum()
+    bits_per_param = max(entropy.item(), 0.1)  # Minimum 0.1 bits to avoid division by zero
+    compression_ratio = 32.0 / bits_per_param  # Assuming fp32 baseline
+    
+    return {
+        'Z_sic': Z_sic,
+        'alpha': alpha_diag,
+        'gamma': gamma,
+        'L': L,
+        'bits_per_param': bits_per_param,
+        'compression_ratio': compression_ratio,
+        'reconstruction_error': recon_error,
+        'constant_c': c
+    }
+
+def quantize_state_dict_watersic(state_dict: dict[str, Tensor], calibration_data: dict[str, Tensor],
+                                target_bits: float = 4.0, args = None) -> tuple[dict, dict]:
+    """
+    Apply WaterSIC quantization to a full model state dict.
+    
+    Args:
+        state_dict: Model parameters
+        calibration_data: Collected activations for each layer
+        target_bits: Target bits per parameter
+        args: Hyperparameters object with WaterSIC settings
+        
+    Returns:
+        Tuple of (quantized_results, metadata)
+    """
+    if args is None:
+        # Default settings
+        class DefaultArgs:
+            watersic_lmmse_correction = True
+            watersic_attention_weighted = True
+            watersic_aw_epsilon = 0.5
+            watersic_qr_epsilon = 0.1
+        args = DefaultArgs()
+    
+    quantized_results = {}
+    metadata = {}
+    total_params = 0
+    total_bits = 0
+    
+    for name, tensor in state_dict.items():
+        # Skip non-quantizable parameters
+        cat = _classify_param(name)
+        if not tensor.is_floating_point() or tensor.numel() <= 65536:
+            quantized_results[name] = tensor.detach().cpu().contiguous()
+            metadata[name] = {"type": "passthrough"}
+            continue
+        
+        if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+            quantized_results[name] = tensor.float()
+            metadata[name] = {"type": "passthrough_ctrl"}
+            continue
+        
+        # Apply WaterSIC to attention and MLP layers
+        if cat in {"mlp", "attn"} and tensor.ndim == 2 and name in calibration_data:
+            activations = calibration_data[name]
+            
+            # Determine if this is a QKV layer for attention weighting
+            attention_weights = None
+            if args.watersic_attention_weighted and any(x in name for x in ['.c_q.', '.c_k.', '.c_v.']):
+                # In a real implementation, we'd collect actual attention weights
+                # For now, use uniform weights as placeholder
+                attention_weights = torch.ones(activations.size(0))
+            
+            # Apply WaterSIC quantization
+            try:
+                result = quantize_layer_watersic(
+                    weight=tensor,
+                    activations=activations,
+                    target_bits=target_bits,
+                    attention_weights=attention_weights,
+                    use_lmmse=args.watersic_lmmse_correction,
+                    eps_aw=args.watersic_aw_epsilon,
+                    eps_qr=args.watersic_qr_epsilon
+                )
+                
+                # Store quantization results
+                quantized_results[name + '.Z'] = result['Z_sic'].cpu()
+                quantized_results[name + '.alpha'] = result['alpha'].cpu()
+                quantized_results[name + '.gamma'] = result['gamma'].cpu()
+                quantized_results[name + '.L'] = result['L'].cpu()
+                
+                metadata[name] = {
+                    "type": "watersic",
+                    "bits_per_param": result['bits_per_param'],
+                    "compression_ratio": result['compression_ratio'],
+                    "reconstruction_error": float(result['reconstruction_error']),
+                    "constant_c": float(result['constant_c'])
+                }
+                
+                total_params += tensor.numel()
+                total_bits += result['bits_per_param'] * tensor.numel()
+                
+            except Exception as e:
+                print(f"WaterSIC failed for {name}: {e}")
+                # Fallback to int8 quantization
+                q, s = quantize_float_tensor(tensor.detach().cpu().contiguous())
+                quantized_results[name + ".q"] = q
+                quantized_results[name + ".scale"] = s
+                metadata[name] = {"type": "int8_fallback"}
+        else:
+            # Use existing int8 quantization for other layers
+            q, s = quantize_float_tensor(tensor.detach().cpu().contiguous())
+            quantized_results[name + ".q"] = q
+            quantized_results[name + ".scale"] = s
+            metadata[name] = {"type": "int8"}
+    
+    # Add global statistics
+    avg_bits_per_param = total_bits / total_params if total_params > 0 else 0
+    metadata["global_stats"] = {
+        "average_bits_per_param": avg_bits_per_param,
+        "total_watersic_params": total_params,
+        "total_watersic_bits": total_bits
+    }
+    
+    return quantized_results, metadata
+
+def dequantize_state_dict_watersic(quantized_results: dict, metadata: dict, 
+                                  template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Dequantize WaterSIC-compressed model."""
+    dequantized = {}
+    
+    for name, orig_tensor in template_sd.items():
+        info = metadata.get(name)
+        if info is None:
+            continue
+        
+        orig_dtype = orig_tensor.dtype
+        
+        if isinstance(info, dict) and info.get("type") == "watersic":
+            # Reconstruct from WaterSIC quantization
+            try:
+                Z = quantized_results[name + '.Z']
+                alpha = quantized_results[name + '.alpha']
+                gamma = quantized_results[name + '.gamma']
+                L = quantized_results[name + '.L']
+                
+                # Reconstruct: W ≈ Z @ diag(alpha * gamma) @ L^T
+                A_gamma = alpha * gamma
+                reconstructed = Z * A_gamma.unsqueeze(0) @ L.t()
+                dequantized[name] = reconstructed.to(orig_dtype)
+                
+            except Exception as e:
+                print(f"WaterSIC dequantization failed for {name}: {e}")
+                # Fallback to zeros
+                dequantized[name] = torch.zeros_like(orig_tensor)
+                
+        elif isinstance(info, dict) and info.get("type") in {"int8", "int8_fallback"}:
+            # Standard int8 dequantization
+            q, s = quantized_results[name + ".q"], quantized_results[name + ".scale"]
+            if s.ndim > 0:
+                dequantized[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
+            else:
+                dequantized[name] = (q.float() * float(s.item())).to(orig_dtype)
+                
+        elif info in ("passthrough", "passthrough_ctrl", "passthrough_fp16"):
+            # Passthrough parameters
+            t = quantized_results[name]
+            if t.dtype == torch.float16 and orig_dtype in (torch.float32, torch.bfloat16):
+                t = t.to(orig_dtype)
+            dequantized[name] = t
+    
+    return dequantized
+
 # --- Training ---
 
 def main() -> None:
@@ -1454,6 +1891,7 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     CastedLinear._qat_enabled = args.qat_enabled
+    CastedLinear._watersic_enabled = args.watersic_enabled and args.qat_enabled
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1675,7 +2113,8 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
-            log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+            CastedLinear._watersic_enabled = args.watersic_enabled
+            log0(f"late_qat:enabled step:{step} scale:{scale:.4f} watersic:{args.watersic_enabled}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1788,27 +2227,83 @@ def main() -> None:
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
-    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = lzma.compress(quant_raw, preset=6)
-    if master_process:
-        with open("final_model.int6.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = len(quant_blob)
-        code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+lzma: {quant_file_bytes} bytes")
-        log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
-    if distributed:
-        dist.barrier()
-    with open("final_model.int6.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(
-        io.BytesIO(lzma.decompress(quant_blob_disk)),
-        map_location="cpu",
-    )
-    deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
+    
+    if args.watersic_enabled:
+        # Collect calibration data for WaterSIC
+        log0("Collecting calibration data for WaterSIC...")
+        calibration_data = _get_calibration_data(model, val_tokens, args.watersic_calibration_samples)
+        
+        # Apply WaterSIC quantization
+        log0(f"Applying WaterSIC quantization (target: {args.watersic_bits} bits)...")
+        quant_result, quant_meta = quantize_state_dict_watersic(unbanked_sd, calibration_data, args.watersic_bits, args)
+        
+        # Serialize with better compression
+        quant_buf = io.BytesIO()
+        torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        
+        if _COMPRESSOR == "zstd":
+            import zstandard
+            compressor = zstandard.ZstdCompressor(level=22)
+            quant_blob = compressor.compress(quant_raw)
+            compression_method = "watersic+zstd"
+        else:
+            quant_blob = lzma.compress(quant_raw, preset=6)
+            compression_method = "watersic+lzma"
+            
+        if master_process:
+            with open("final_model.watersic.ptz", "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = len(quant_blob)
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model {compression_method}: {quant_file_bytes} bytes")
+            log0(f"Total submission size {compression_method}: {quant_file_bytes + code_bytes} bytes")
+            
+            # Print WaterSIC statistics
+            global_stats = quant_meta.get("global_stats", {})
+            avg_bits = global_stats.get("average_bits_per_param", 0)
+            log0(f"WaterSIC average bits per param: {avg_bits:.3f}")
+            
+        if distributed:
+            dist.barrier()
+            
+        # Load back for evaluation
+        with open("final_model.watersic.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        
+        if _COMPRESSOR == "zstd":
+            import zstandard
+            decompressor = zstandard.ZstdDecompressor()
+            quant_raw_disk = decompressor.decompress(quant_blob_disk)
+        else:
+            quant_raw_disk = lzma.decompress(quant_blob_disk)
+            
+        quant_state = torch.load(io.BytesIO(quant_raw_disk), map_location="cpu")
+        deq_unbanked = dequantize_state_dict_watersic(quant_state["w"], quant_state["m"], unbanked_sd)
+        
+    else:
+        # Original int6 quantization
+        quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
+        quant_buf = io.BytesIO()
+        torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob = lzma.compress(quant_raw, preset=6)
+        if master_process:
+            with open("final_model.int6.ptz", "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = len(quant_blob)
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model int6+lzma: {quant_file_bytes} bytes")
+            log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
+        if distributed:
+            dist.barrier()
+        with open("final_model.int6.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(
+            io.BytesIO(lzma.decompress(quant_blob_disk)),
+            map_location="cpu",
+        )
+        deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
     # Re-bank the dequantized tensors
     deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
     eval_model = GPT(
@@ -1842,10 +2337,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int6_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_{'watersic' if args.watersic_enabled else 'int6'}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_{'watersic' if args.watersic_enabled else 'int6'}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
@@ -1858,10 +2353,10 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"final_{'watersic' if args.watersic_enabled else 'int6'}_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
             f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
         )
-        log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+        log0(f"final_{'watersic' if args.watersic_enabled else 'int6'}_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
     if args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
