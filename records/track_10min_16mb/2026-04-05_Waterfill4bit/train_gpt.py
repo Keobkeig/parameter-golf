@@ -1433,8 +1433,10 @@ def _get_calibration_activations(model: nn.Module, val_tokens: Tensor, max_sampl
     with torch.no_grad():
         while samples_collected < max_samples:
             start_idx = torch.randint(0, len(val_tokens) - seq_len, (1,)).item()
-            tokens = val_tokens[start_idx:start_idx + seq_len].unsqueeze(0).to(device)
-            model(tokens)
+            chunk = val_tokens[start_idx:start_idx + seq_len + 1].to(device)
+            tokens = chunk[:-1].unsqueeze(0)
+            targets = chunk[1:].unsqueeze(0)
+            model(tokens, targets)
             samples_collected += seq_len
     
     # Remove hooks
