@@ -4,7 +4,9 @@
       "Bash(ssh:*)",
       "WebFetch(domain:arxiv.org)",
       "Bash(scp -i /Users/rxue/.runpod/ssh/RunPod-Key-Go -P 19578 -o StrictHostKeyChecking=no /tmp/wf4_setup2.sh root@64.247.201.32:/tmp/wf4_setup2.sh)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(runpodctl pod:*)",
+      "Bash(python3 -c ':*)"
     ]
   }
 }

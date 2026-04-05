@@ -25,15 +25,14 @@ fi
 
 cd parameter-golf
 
-# Overlay the watersic submission from the fork
-echo "--- Adding watersic submission from Keobkeig/parameter-golf ---"
-SUBMISSION_DIR="records/track_10min_16mb/2026-03-29_LeakyReLU_LegalTTT_ParallelMuon_Copy"
-if [ ! -d "$SUBMISSION_DIR" ]; then
-    git remote add fork https://github.com/Keobkeig/parameter-golf.git 2>/dev/null || true
-    git fetch fork copy-pr549-2026-03-29 --depth=1
-    git checkout fork/copy-pr549-2026-03-29 -- "$SUBMISSION_DIR"
-    git checkout fork/copy-pr549-2026-03-29 -- run_submission.sh run_smoke_test.sh
-fi
+# Overlay submissions from the fork
+echo "--- Adding submissions from Keobkeig/parameter-golf ---"
+git remote add fork https://github.com/Keobkeig/parameter-golf.git 2>/dev/null || true
+git fetch fork copy-pr549-2026-03-29 --depth=1
+git checkout fork/copy-pr549-2026-03-29 -- \
+    records/track_10min_16mb/2026-03-29_LeakyReLU_LegalTTT_ParallelMuon_Copy \
+    records/track_10min_16mb/2026-04-05_Waterfill6bit \
+    run_submission.sh run_smoke_test.sh
 
 echo "--- Downloading FineWeb sp1024 ($NUM_TRAIN_SHARDS train shards) ---"
 python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards "$NUM_TRAIN_SHARDS"
