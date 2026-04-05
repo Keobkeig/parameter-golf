@@ -1433,7 +1433,7 @@ def _get_calibration_activations(model: nn.Module, val_tokens: Tensor, max_sampl
     with torch.no_grad():
         while samples_collected < max_samples:
             start_idx = torch.randint(0, len(val_tokens) - seq_len, (1,)).item()
-            chunk = val_tokens[start_idx:start_idx + seq_len + 1].to(device)
+            chunk = val_tokens[start_idx:start_idx + seq_len + 1].to(device=device, dtype=torch.int64)
             tokens = chunk[:-1].unsqueeze(0)
             targets = chunk[1:].unsqueeze(0)
             model(tokens, targets)
@@ -1472,11 +1472,14 @@ def _waterfill_quantize_weight(weight: Tensor, activations: Tensor | None) -> di
     if activations is not None and activations.numel() > 0:
         act = activations.float()  # [samples, in_dim]
         h = act.pow(2).mean(dim=0).clamp_min(1e-8).sqrt()  # [in_dim]
-        col_range = w32.abs().amax(dim=0).clamp_min(1.0 / clip)
-        col_scale = (h * col_range / clip).clamp_min(1.0 / clip)
+        col_range = w32.abs().amax(dim=0).clamp_min(1e-6)
+        # Waterfilling: finer resolution for high-activation columns
+        # Normalize h so the mean column gets naive scale; high-h columns get finer
+        h_norm = h / h.mean().clamp_min(1e-8)
+        col_scale = (col_range / (h_norm.clamp_min(0.25) * clip)).clamp_min(1e-6)
     else:
         # Fallback: plain per-column max scale
-        col_scale = w32.abs().amax(dim=0).clamp_min(1.0 / clip) / clip
+        col_scale = w32.abs().amax(dim=0).clamp_min(1e-6) / clip
 
     col_scale_f16 = col_scale.to(torch.float16)
     col_scale_f32 = col_scale_f16.float()
