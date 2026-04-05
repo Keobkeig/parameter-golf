@@ -1,72 +1,52 @@
 #!/bin/bash
 set -e
+# Run this on the pod after SSH-ing in.
+# Usage: bash runpod_setup.sh [NUM_TRAIN_SHARDS]
+#        bash runpod_setup.sh 1    # quick smoke-test subset
+#        bash runpod_setup.sh 80   # full 8B token dataset (default)
 
-echo "🚀 WaterSIC RunPod Deployment Script"
-echo "===================================="
+NUM_TRAIN_SHARDS=${1:-80}
 
-# Environment setup
-export DEBIAN_FRONTEND=noninteractive
-export PYTHONUNBUFFERED=1
-
-# System information
-echo "📋 System Information:"
-nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
-echo "Python: $(python3 --version)"
-echo "CUDA: $(nvcc --version | grep 'release' || echo 'Not found')"
-echo "GPU Memory: $(nvidia-ml-py3 2>/dev/null || nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)MB"
+echo "=== parameter-golf RunPod Setup ==="
+echo "Image: runpod/parameter-golf:latest (Python 3.12, PyTorch 2.9.1, CUDA 12.8)"
+echo "Train shards: $NUM_TRAIN_SHARDS"
 echo ""
 
-# Install dependencies
-echo "📦 Installing Dependencies..."
-pip install --upgrade pip
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install numpy tqdm huggingface-hub datasets tiktoken sentencepiece zstandard
-echo "✅ Dependencies installed"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo ""
 
-# Verify installations
-echo "🔍 Verifying Installations..."
-python3 -c "
-import torch
-import numpy as np
-import zstandard
-print(f'✅ PyTorch: {torch.__version__}')
-print(f'✅ CUDA available: {torch.cuda.is_available()}')
-if torch.cuda.is_available():
-    print(f'✅ GPU: {torch.cuda.get_device_name(0)}')
-    print(f'✅ GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB')
-print(f'✅ NumPy: {np.__version__}')
-print(f'✅ Zstandard: {zstandard.__version__}')
-"
-echo ""
+cd /workspace
 
-# Download parameter-golf if not exists
+# Clone the official repo (matches what the template image expects)
 if [ ! -d "parameter-golf" ]; then
-    echo "📥 Cloning parameter-golf repository..."
-    git clone https://github.com/KellerJordan/parameter-golf.git
-    cd parameter-golf
-else
-    echo "📁 Using existing parameter-golf directory"
-    cd parameter-golf
-    git pull origin main
+    echo "--- Cloning openai/parameter-golf ---"
+    git clone https://github.com/openai/parameter-golf.git
 fi
 
-# Create WaterSIC test directory
-echo "📁 Setting up WaterSIC test environment..."
-mkdir -p watersic_test_results
-cd watersic_test_results
+cd parameter-golf
 
-# Copy our WaterSIC implementation
-echo "📋 Copying WaterSIC implementation..."
-cp -r ../records/track_10min_16mb/2026-03-29_LeakyReLU_LegalTTT_ParallelMuon_Copy ./watersic_implementation/
+# Overlay the watersic submission from the fork
+echo "--- Adding watersic submission from Keobkeig/parameter-golf ---"
+SUBMISSION_DIR="records/track_10min_16mb/2026-03-29_LeakyReLU_LegalTTT_ParallelMuon_Copy"
+if [ ! -d "$SUBMISSION_DIR" ]; then
+    git remote add fork https://github.com/Keobkeig/parameter-golf.git 2>/dev/null || true
+    git fetch fork copy-pr549-2026-03-29 --depth=1
+    git checkout fork/copy-pr549-2026-03-29 -- "$SUBMISSION_DIR"
+    git checkout fork/copy-pr549-2026-03-29 -- run_submission.sh run_smoke_test.sh
+fi
 
-echo "✅ RunPod environment setup complete!"
+echo "--- Downloading FineWeb sp1024 ($NUM_TRAIN_SHARDS train shards) ---"
+python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards "$NUM_TRAIN_SHARDS"
+
+mkdir -p logs
+
 echo ""
-echo "🎯 Ready to run WaterSIC tests!"
-echo "   - WaterSIC implementation: ./watersic_implementation/"
-echo "   - Test results: ./watersic_test_results/"
+echo "=== Setup complete! ==="
 echo ""
-echo "Next steps:"
-echo "1. Run baseline test: ./run_baseline.sh"
-echo "2. Run WaterSIC test: ./run_watersic.sh"
-echo "3. Compare results: ./compare_results.sh"
+echo "Smoke test (1 GPU, 200 steps):"
+echo "  bash run_smoke_test.sh"
+echo ""
+echo "Full submission (all GPUs, seed 1337/42/2025):"
+echo "  bash run_submission.sh"
+echo "  SEED=42 bash run_submission.sh"
+echo "  SEED=2025 bash run_submission.sh"
