@@ -50,7 +50,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 13))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -556,12 +556,17 @@ class CastedLinear(nn.Linear):
         w = self.weight.to(x.dtype)
         if self.training and w.ndim == 2:
             if CastedLinear._waterfill_enabled:
-                # 6-bit waterfill fake quantization: per-column scale STE
+                # 6-bit waterfill STE: use activation-weighted per-column scale
+                # computed from the current batch — matches the post-training formula exactly.
                 with torch.no_grad():
                     w32 = self.weight.float()
-                    col_scale = w32.abs().amax(dim=0).clamp_min(1e-6)
-                    w_norm = w32 / col_scale[None, :]
-                    w_q = (torch.clamp(torch.round(w_norm * 31.0), -32.0, 31.0) / 31.0 * col_scale[None, :]).to(x.dtype)
+                    x_flat = x.detach().float().reshape(-1, x.shape[-1])  # [B*T, in_dim]
+                    h = x_flat.pow(2).mean(dim=0).clamp_min(1e-8).sqrt()
+                    col_range = w32.abs().amax(dim=0).clamp_min(1e-6)
+                    h_norm = h / h.mean().clamp_min(1e-8)
+                    col_scale = (col_range / (h_norm.clamp_min(0.25) * 31.0)).clamp_min(1e-6)
+                    col_scale = col_scale.to(torch.float16).float()  # fp16 round-trip matches inference
+                    w_q = (torch.clamp(torch.round(w32 / col_scale[None, :]), -32.0, 31.0) * col_scale[None, :]).to(x.dtype)
                 w = w + (w_q - w).detach()
             elif CastedLinear._qat_enabled:
                 # int6 per-row fake quantization (fallback)
@@ -2303,15 +2308,9 @@ def main() -> None:
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
     
     def _compress(data: bytes) -> bytes:
-        if _COMPRESSOR == "zstd":
-            import zstandard
-            return zstandard.ZstdCompressor(level=22).compress(data)
         return lzma.compress(data, preset=9)
 
     def _decompress(data: bytes) -> bytes:
-        if _COMPRESSOR == "zstd":
-            import zstandard
-            return zstandard.ZstdDecompressor().decompress(data)
         return lzma.decompress(data)
 
     if args.waterfill_enabled:
