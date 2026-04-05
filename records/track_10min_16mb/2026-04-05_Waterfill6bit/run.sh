@@ -1,0 +1,32 @@
+#!/bin/bash
+# Waterfill-6bit submission run
+# Activation-weighted per-column int6 quantization + zstd-22
+# Usage: SEED=1337 bash run.sh
+set -e
+
+SEED=${SEED:-1337}
+NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+echo "=== Waterfill-6bit | seed=$SEED | GPUs=$NUM_GPUS ==="
+
+# Ensure zstandard is available for zstd-22 compression
+pip install -q zstandard 2>/dev/null || true
+
+NUM_LAYERS=13 BIGRAM_VOCAB_SIZE=1536 XSA_LAST_N=0 \
+WATERFILL_ENABLED=1 WATERFILL_CALIBRATION_SAMPLES=512 \
+EMA_ENABLED=1 EMA_DECAY=0.997 SWA_ENABLED=1 SWA_EVERY=50 \
+ROPE_DIMS=16 LN_SCALE=1 LATE_QAT=1 LATE_QAT_THRESHOLD=0.15 \
+VE_ENABLED=1 VE_DIM=128 VE_LAYERS=11,12 \
+TTT_ENABLED=1 TTT_LR=0.002 TTT_EPOCHS=3 TTT_CHUNK_TOKENS=32768 \
+TTT_FREEZE_BLOCKS=0 TTT_MOMENTUM=0.9 TTT_BATCH_SEQS=32 TTT_GRAD_CLIP=1.0 \
+MUON_WD=0.04 ADAM_WD=0.04 \
+MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035 \
+MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92 \
+MUON_MOMENTUM_WARMUP_STEPS=1500 WARMDOWN_ITERS=3500 \
+ITERATIONS=9000 MAX_WALLCLOCK_SECONDS=600 EVAL_STRIDE=64 \
+DATA_PATH="$REPO_ROOT/data/datasets/fineweb10B_sp1024" \
+TOKENIZER_PATH="$REPO_ROOT/data/tokenizers/fineweb_1024_bpe.model" \
+SEED="$SEED" \
+torchrun --standalone --nproc_per_node="$NUM_GPUS" \
+    "$(dirname "$0")/train_gpt.py" 2>&1 | tee "$REPO_ROOT/logs/wf6_seed${SEED}_$(date +%Y%m%d_%H%M%S).log"
